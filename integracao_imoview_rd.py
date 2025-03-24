@@ -26,20 +26,33 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 
-# Configurações da API - Carregar de variáveis de ambiente ou usar valores padrão
-IMOVIEW_API_KEY = os.environ.get("IMOVIEW_API_KEY", "52f913f76e0e9fe2f928f2fe86c2d38d")
-RD_TOKEN_PUBLICO = os.environ.get("RD_TOKEN_PUBLICO", "3857b1803f2f80e63010781e6592710a")
+# Configurações da API - Carregar de variáveis de ambiente
+IMOVIEW_API_KEY = os.environ.get("IMOVIEW_API_KEY")
+RD_TOKEN_PUBLICO = os.environ.get("RD_TOKEN_PUBLICO")
+# Tempo em horas para olhar para trás (padrão: 24 horas = 1 dia)
+HOURS_LOOKBACK = int(os.environ.get("HOURS_LOOKBACK", 24))
 
-# Cabeçalhos para Imoview
+# Verificar se as chaves de API estão configuradas
+if not IMOVIEW_API_KEY:
+    logger.error("IMOVIEW_API_KEY não configurada nas variáveis de ambiente")
+    raise ValueError("IMOVIEW_API_KEY não configurada")
+
+if not RD_TOKEN_PUBLICO:
+    logger.error("RD_TOKEN_PUBLICO não configurado nas variáveis de ambiente")
+    raise ValueError("RD_TOKEN_PUBLICO não configurado")
+
+# Cabeçalhos para Imoview - com a chave de acesso fornecida pela UNIVERSAL SOFTWARE
 HEADERS_IMOVIEW = {
     "accept": "application/json",
-    "chave": IMOVIEW_API_KEY
+    "chave": IMOVIEW_API_KEY  # A chave de acesso deve ser enviada no cabeçalho com o nome 'chave'
 }
 
-# URLs base para as APIs
+# URL base Imoview
 IMOVIEW_BASE_URL = "https://api.imoview.com.br/Atendimento/RetornarAtendimentos"
+
+# URLs do RD Station
 RD_CONVERSIONS_URL = "https://api.rd.services/platform/events?event_type=conversion"
-RD_LEGACY_URL = "https://www.rdstation.com.br/api/1.3/conversions"
+RD_LEGACY_URL = "https://www.rdstation.com.br/api/1.3/conversions"  # URL legada
 
 # Mapeamento de fases do Imoview
 FASE_VISITA = 4    # Visita
@@ -53,87 +66,212 @@ EVENTOS_CONVERSAO = {
     FASE_VENDA: "imoview-update_Venda"
 }
 
-def obter_inicio_do_dia():
-    """
-    Retorna a data/hora do início do dia atual no formato usado pelo Imoview (dd/mm/aaaa hh:mm)
-    """
-    inicio_do_dia = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    return inicio_do_dia.strftime("%d/%m/%Y %H:%M")
+def testar_conexao():
+    """Função para testar a conexão básica com a API Imoview"""
+    try:
+        # Tente uma requisição simples
+        response = requests.get(
+            "https://api.imoview.com.br/versao", 
+            headers=HEADERS_IMOVIEW
+        )
+        logger.info(f"Teste de conexão: {response.status_code}")
+        logger.info(f"Resposta: {response.text}")
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Erro no teste de conexão: {e}")
+        return False
 
-def obter_dados_imoview(fase, pagina=1, registros_por_pagina=100, finalidade=2, situacao=0):
+def obter_data_anterior(horas=HOURS_LOOKBACK):
     """
-    Obtém os dados da API do Imoview com os parâmetros corretos, filtrando registros do dia atual
+    Retorna a data/hora de X horas atrás
+    Por padrão, retorna a data/hora de 24 horas atrás (último dia)
+    """
+    data_anterior = datetime.datetime.now() - datetime.timedelta(hours=horas)
+    return data_anterior
+
+def parse_data(data_str):
+    """
+    Tenta converter uma string de data para um objeto datetime
+    Suporta múltiplos formatos de data
+    
+    Parâmetros:
+    - data_str: string contendo a data
+    
+    Retorna:
+    - objeto datetime ou None se não conseguir converter
+    """
+    if not data_str:
+        return None
+        
+    # Verificar o formato da data (se tem hora ou não)
+    if len(data_str) > 10 and (':' in data_str or ' ' in data_str):
+        # Formato com data e hora
+        formats_to_try = [
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M"
+        ]
+    else:
+        # Formato apenas com data
+        formats_to_try = [
+            "%d/%m/%Y",
+            "%Y-%m-%d"
+        ]
+    
+    # Tenta diferentes formatos de data
+    for date_format in formats_to_try:
+        try:
+            return datetime.datetime.strptime(data_str, date_format)
+        except ValueError:
+            continue
+    
+    return None
+
+def obter_dados_imoview(fase, pagina=1, registros_por_pagina=20, finalidade=2, situacao=0):
+    """
+    Obtém os dados da API do Imoview com os parâmetros básicos, sem filtro de data
     
     Parâmetros:
     - fase: código da fase (ex: 4=visita)
     - pagina: número da página para paginação
-    - registros_por_pagina: quantidade de registros por página (aumentado para 100)
+    - registros_por_pagina: quantidade de registros por página
     - finalidade: código de finalidade (padrão=2)
     - situacao: código de situação (padrão=0)
     """
-    # Obter data/hora do início do dia atual para filtro
-    data_inicio_dia = obter_inicio_do_dia()
-    
-    # Construir parâmetros para a requisição
     params = {
         "numeroPagina": pagina,
         "numeroRegistros": registros_por_pagina,
         "finalidade": finalidade,
         "situacao": situacao,
         "fase": fase,
-        "dataInicio": data_inicio_dia  # Filtrar registros desde o início do dia atual
     }
     
     try:
-        logger.info(f"Buscando dados do Imoview para fase {fase}, página {pagina}, a partir de {data_inicio_dia}...")
+        logger.info(f"Buscando dados do Imoview para fase {fase}, página {pagina}...")
+        logger.info(f"Parâmetros: {params}")
         
-        # Log detalhado para debug
-        param_str = "&".join([f"{k}={v}" for k, v in params.items()])
-        logger.info(f"URL completa: {IMOVIEW_BASE_URL}?{param_str}")
-        logger.info(f"Cabeçalhos: {HEADERS_IMOVIEW}")
-        
-        # Fazer a requisição GET
-        response = requests.get(
-            IMOVIEW_BASE_URL,
-            params=params,
-            headers=HEADERS_IMOVIEW,
-            timeout=15
-        )
-        
-        # Log da resposta
-        logger.info(f"Status da resposta: {response.status_code}")
-        
+        response = requests.get(IMOVIEW_BASE_URL, params=params, headers=HEADERS_IMOVIEW)
         response.raise_for_status()
+        logger.info(f"Resposta Imoview: {response.status_code}")
         
-        try:
-            data = response.json()
-            logger.info(f"Resposta JSON recebida com sucesso. Começo: {str(data)[:100]}...")
+        data = response.json()
+        
+        # Verificar se precisamos buscar mais páginas
+        total_registros = data.get('totalRegistros', 0) if isinstance(data, dict) else 0
+        registros_atuais = len(data.get('lista', [])) if isinstance(data, dict) else len(data)
+        
+        logger.info(f"Recebidos {registros_atuais} de um total de {total_registros} registros")
+        
+        # Limitar a quantidade máxima de páginas para não sobrecarregar a API
+        # Vamos buscar no máximo 5 páginas (100 registros com 20 por página)
+        max_paginas = min(5, (total_registros + registros_por_pagina - 1) // registros_por_pagina)
+        
+        # Se existem mais registros e estamos na primeira página, busca algumas páginas adicionais
+        if isinstance(data, dict) and 'lista' in data and pagina == 1 and max_paginas > 1:
+            registros = data.get('lista', [])
             
-            # Verifica se há mais páginas para buscar
-            if isinstance(data, dict) and 'lista' in data and len(data['lista']) == registros_por_pagina:
-                logger.info(f"Detectada possibilidade de mais registros. Buscando próxima página...")
-                proxima_pagina = pagina + 1
-                dados_proxima_pagina = obter_dados_imoview(fase, proxima_pagina, registros_por_pagina, finalidade, situacao)
+            # Buscar páginas adicionais (a partir da página 2)
+            for p in range(2, max_paginas + 1):
+                logger.info(f"Buscando página adicional {p} de {max_paginas}...")
+                next_page = obter_dados_imoview(fase, p, registros_por_pagina, finalidade, situacao)
                 
-                # Combina os resultados
-                if dados_proxima_pagina and isinstance(dados_proxima_pagina, dict) and 'lista' in dados_proxima_pagina:
-                    data['lista'].extend(dados_proxima_pagina['lista'])
-                    logger.info(f"Combinados {len(data['lista'])} registros no total após buscar múltiplas páginas")
+                if isinstance(next_page, dict) and 'lista' in next_page:
+                    registros.extend(next_page['lista'])
+                elif isinstance(next_page, list):
+                    registros.extend(next_page)
+                
+                # Pequena pausa para não sobrecarregar a API
+                time.sleep(1)
             
-            return data
-        except json.JSONDecodeError as e:
-            logger.error(f"Erro ao decodificar JSON: {e}")
-            logger.error(f"Resposta recebida: {response.text[:300]}...")
-            return None
-            
+            return {'lista': registros, 'totalRegistros': total_registros}
+        
+        return data
     except requests.exceptions.RequestException as e:
         logger.error(f"Erro ao acessar a API do Imoview: {e}")
         if hasattr(e, 'response') and e.response:
-            logger.error(f"Detalhes do erro: {e.response.status_code} - {e.response.text[:200]}")
+            logger.error(f"Detalhes do erro: {e.response.status_code} - {e.response.text}")
         return None
-    except Exception as e:
-        logger.error(f"Erro não esperado: {type(e).__name__}: {e}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Erro ao decodificar resposta JSON: {e}")
+        logger.error(f"Resposta recebida: {response.text[:200]}...")
         return None
+
+def filtrar_registros_por_data(registros, data_corte, tipo_fase):
+    """
+    Filtra registros pela data específica de acordo com o tipo de fase
+    Mantém apenas registros mais recentes que a data de corte
+    
+    Parâmetros:
+    - registros: lista de registros do Imoview
+    - data_corte: data/hora para filtrar registros
+    - tipo_fase: tipo de fase (visita, proposta, venda)
+    
+    Retorna:
+    - lista filtrada contendo apenas registros mais recentes que a data de corte
+    """
+    registros_filtrados = []
+    data_corte_str = data_corte.strftime("%d/%m/%Y %H:%M")
+    
+    logger.info(f"Filtrando registros a partir de {data_corte_str}")
+    
+    for registro in registros:
+        registro_valido = False
+        data_registro = None
+        
+        # Filtro específico para cada tipo de fase
+        if tipo_fase == FASE_VISITA:
+            # Para Visita, verificar o campo datavisita
+            if 'datavisita' in registro:
+                data_registro = parse_data(registro['datavisita'])
+            elif 'dataVisita' in registro:
+                data_registro = parse_data(registro['dataVisita'])
+                
+        elif tipo_fase == FASE_PROPOSTA:
+            # Para Proposta, verificar datanegociacao dentro de imoveisproposta
+            if 'imoveisproposta' in registro and isinstance(registro['imoveisproposta'], list) and len(registro['imoveisproposta']) > 0:
+                for proposta in registro['imoveisproposta']:
+                    if 'negociacoes' in proposta and isinstance(proposta['negociacoes'], list) and len(proposta['negociacoes']) > 0:
+                        for negociacao in proposta['negociacoes']:
+                            if 'datanegociacao' in negociacao:
+                                data_temp = parse_data(negociacao['datanegociacao'])
+                                if data_temp and (data_registro is None or data_temp > data_registro):
+                                    data_registro = data_temp
+                                    
+        elif tipo_fase == FASE_VENDA:
+            # Para Venda, verificar datanegocio dentro de imoveisnegocio
+            if 'imoveisnegocio' in registro and isinstance(registro['imoveisnegocio'], list) and len(registro['imoveisnegocio']) > 0:
+                for negocio in registro['imoveisnegocio']:
+                    if 'datanegocio' in negocio:
+                        data_temp = parse_data(negocio['datanegocio'])
+                        if data_temp and (data_registro is None or data_temp > data_registro):
+                            data_registro = data_temp
+        
+        # Se não encontramos dados específicos para a fase, verificar campos genéricos
+        if data_registro is None:
+            # Verificar outros campos de data comuns
+            data_campos = [
+                'datainclusao', 'dataInclusao', 'data_inclusao',
+                'dataalteracao', 'dataAlteracao', 'data_alteracao',
+                'dataCadastro', 'data'
+            ]
+            
+            for campo in data_campos:
+                if campo in registro and registro[campo]:
+                    data_temp = parse_data(registro[campo])
+                    if data_temp:
+                        data_registro = data_temp
+                        break
+        
+        # Verificar se a data encontrada é mais recente que a data de corte
+        if data_registro and data_registro >= data_corte:
+            registro_valido = True
+            
+        if registro_valido:
+            registros_filtrados.append(registro)
+    
+    logger.info(f"Filtro aplicado: {len(registros_filtrados)} de {len(registros)} registros mantidos")
+    return registros_filtrados
 
 def enviar_evento_conversao(email, tipo_fase, midia=None, campanha=None):
     """
@@ -181,15 +319,11 @@ def enviar_evento_conversao(email, tipo_fase, midia=None, campanha=None):
     
     try:
         logger.info(f"Enviando evento {evento} para {email} via API nova...")
-        
-        # Log da URL para debug
-        logger.info(f"URL de envio: {RD_CONVERSIONS_URL}")
-        
-        response = requests.post(RD_CONVERSIONS_URL, json=payload, headers=headers, timeout=15)
+        response = requests.post(RD_CONVERSIONS_URL, json=payload, headers=headers)
         
         # Log da resposta para depuração
-        logger.info(f"Status: {response.status_code}")
-        logger.info(f"Resposta: {response.text[:200]}...")
+        logger.debug(f"Status: {response.status_code}")
+        logger.debug(f"Resposta: {response.text[:200]}...")
         
         response.raise_for_status()
         logger.info(f"Evento de conversão enviado com sucesso ({email}, {evento})")
@@ -197,14 +331,11 @@ def enviar_evento_conversao(email, tipo_fase, midia=None, campanha=None):
     except requests.exceptions.RequestException as e:
         logger.warning(f"Erro ao enviar evento de conversão ({email}, {evento}): {e}")
         if hasattr(e, 'response') and e.response:
-            logger.warning(f"Detalhes do erro: {e.response.status_code} - {e.response.text[:200]}")
+            logger.warning(f"Detalhes do erro: {e.response.status_code} - {e.response.text}")
         
         # Tentar com formato antigo
         logger.info("Tentando enviar usando o formato antigo de API...")
         return enviar_evento_legacy(email, evento, midia, campanha)
-    except Exception as e:
-        logger.error(f"Erro não esperado: {type(e).__name__}: {e}")
-        return False
 
 def enviar_evento_legacy(email, evento, midia=None, campanha=None):
     """
@@ -233,15 +364,11 @@ def enviar_evento_legacy(email, evento, midia=None, campanha=None):
     
     try:
         logger.info(f"Enviando evento {evento} para {email} via API legada...")
-        
-        # Log da URL para debug
-        logger.info(f"URL de envio legacy: {RD_LEGACY_URL}")
-        
-        response = requests.post(RD_LEGACY_URL, json=legacy_payload, headers=legacy_headers, timeout=15)
+        response = requests.post(RD_LEGACY_URL, json=legacy_payload, headers=legacy_headers)
         
         # Log da resposta para depuração
-        logger.info(f"Status: {response.status_code}")
-        logger.info(f"Resposta: {response.text[:200]}...")
+        logger.debug(f"Status: {response.status_code}")
+        logger.debug(f"Resposta: {response.text[:200]}...")
         
         response.raise_for_status()
         logger.info(f"Evento enviado com sucesso via API legada ({email}, {evento})")
@@ -249,22 +376,19 @@ def enviar_evento_legacy(email, evento, midia=None, campanha=None):
     except requests.exceptions.RequestException as e:
         logger.warning(f"Erro ao enviar via API legada ({email}, {evento}): {e}")
         if hasattr(e, 'response') and e.response:
-            logger.warning(f"Detalhes do erro: {e.response.status_code} - {e.response.text[:200]}")
+            logger.warning(f"Detalhes do erro: {e.response.status_code} - {e.response.text}")
         
         # Tentar alternativa com form-urlencoded (último recurso)
         try:
             logger.info("Tentando enviar como form-urlencoded...")
             headers = {"Content-Type": "application/x-www-form-urlencoded"}
-            response = requests.post(RD_LEGACY_URL, data=legacy_payload, headers=headers, timeout=15)
+            response = requests.post(RD_LEGACY_URL, data=legacy_payload, headers=headers)
             response.raise_for_status()
             logger.info(f"Evento enviado com sucesso após retry como form-urlencoded ({email}, {evento})")
             return True
         except requests.exceptions.RequestException as e2:
             logger.error(f"Erro na última tentativa: {e2}")
             return False
-    except Exception as e:
-        logger.error(f"Erro não esperado: {type(e).__name__}: {e}")
-        return False
 
 def extrair_email(negocio):
     """
@@ -311,13 +435,14 @@ def extrair_midia_campanha(negocio):
     
     return midia, campanha
 
-def processar_dados(dados, tipo_fase):
+def processar_dados(dados, tipo_fase, data_corte):
     """
     Processa os dados recebidos da API Imoview
     
     Parâmetros:
     - dados: dados retornados pela API
     - tipo_fase: tipo de fase sendo processada (para determinar ação no RD Station)
+    - data_corte: data a partir da qual considerar os registros
     """
     if not dados:
         logger.info(f"Nenhum dado para processar na fase {tipo_fase}")
@@ -338,12 +463,18 @@ def processar_dados(dados, tipo_fase):
     else:
         logger.warning(f"Formato de dados inesperado: {type(dados)}")
         return 0
-
-    logger.info(f"Processando {len(registros)} registros da fase {tipo_fase}...")
+    
+    # Filtrar os registros pela data específica para cada fase
+    registros_filtrados = filtrar_registros_por_data(registros, data_corte, tipo_fase)
+    
+    logger.info(f"Processando {len(registros_filtrados)} registros da fase {tipo_fase} após filtro de data...")
     contador = 0
     contador_sem_email = 0
     
-    for negocio in registros:
+    # Rastrear emails já processados para evitar duplicatas
+    emails_processados = set()
+    
+    for negocio in registros_filtrados:
         # Extrair o email do registro
         email = extrair_email(negocio)
         
@@ -352,6 +483,12 @@ def processar_dados(dados, tipo_fase):
             contador_sem_email += 1
             codigo = negocio.get('codigo', 'sem_codigo')
             logger.warning(f"Registro sem email: {codigo}")
+            continue
+        
+        # Verificar se já processamos este email para evitar duplicatas na mesma fase
+        email_key = f"{email}_{tipo_fase}"
+        if email_key in emails_processados:
+            logger.info(f"Email {email} já processado para fase {tipo_fase}, pulando...")
             continue
         
         # Extrair mídia e campanha do registro
@@ -363,6 +500,7 @@ def processar_dados(dados, tipo_fase):
         # Enviar evento de conversão conforme a fase
         if enviar_evento_conversao(email, tipo_fase, midia, campanha):
             contador += 1
+            emails_processados.add(email_key)
         
         # Pequena pausa para não sobrecarregar as APIs
         time.sleep(0.5)
@@ -374,9 +512,16 @@ def main():
     """
     Função principal que executa o processo completo
     """
-    data_hoje = datetime.datetime.now().strftime("%d/%m/%Y")
-    logger.info(f"Iniciando integração Imoview -> RD Station para o dia {data_hoje}...")
-    logger.info(f"Buscando registros desde: {obter_inicio_do_dia()}")
+    logger.info("Iniciando integração Imoview -> RD Station...")
+    
+    # Testar conexão básica com a API
+    if not testar_conexao():
+        logger.error("Falha no teste de conexão básica com a API Imoview")
+        return
+        
+    # Calcular a data de corte (registros mais recentes que esta data serão processados)
+    data_corte = obter_data_anterior()
+    logger.info(f"Data de corte para processamento: {data_corte.strftime('%d/%m/%Y %H:%M')}")
     
     # Processar cada tipo de fase
     fases = [FASE_VISITA, FASE_PROPOSTA, FASE_VENDA]
@@ -385,16 +530,24 @@ def main():
     for fase in fases:
         logger.info(f"\n=== Processando fase {fase} ({EVENTOS_CONVERSAO[fase]}) ===")
         
-        # Obter dados da fase atual
+        # Obter dados da fase atual (sem filtro de data)
         dados = obter_dados_imoview(fase)
         
-        # Processar dados
-        contador = processar_dados(dados, fase)
+        # Processar dados com filtro de data específico para cada fase
+        contador = processar_dados(dados, fase, data_corte)
         total_processado += contador
         
         logger.info(f"Fase {fase}: {contador} eventos enviados")
+        
+    # Adicionar envio de um evento de teste se não houver dados processados
+    if total_processado == 0:
+        logger.info("Nenhum registro processado. Enviando evento de teste...")
+        test_email = "teste@example.com"  # Substitua por um email válido para teste
+        if enviar_evento_conversao(test_email, FASE_VISITA, "teste", "teste"):
+            logger.info(f"Evento de teste enviado com sucesso para {test_email}")
+            total_processado += 1
     
-    logger.info(f"\nProcessamento concluído. Total de {total_processado} eventos enviados para o dia {data_hoje}.")
+    logger.info(f"\nProcessamento concluído. Total de {total_processado} eventos enviados.")
 
 if __name__ == "__main__":
     main()
