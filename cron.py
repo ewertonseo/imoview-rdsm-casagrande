@@ -60,3 +60,21 @@ executar_integracao()
 while True:
     schedule.run_pending()
     time.sleep(60)  # Verifica a cada minuto
+
+# No topo do arquivo, após os imports:
+PORT = os.environ.get("PORT", "8080")
+
+# Adicione depois do loop principal
+import http.server
+import socketserver
+import threading
+
+def start_web_server():
+    """Inicia um servidor web simples para manter o Railway feliz"""
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", int(PORT)), handler) as httpd:
+        logging.info(f"Servidor web iniciado na porta {PORT}")
+        httpd.serve_forever()
+
+# Inicia o servidor web em uma thread separada
+threading.Thread(target=start_web_server, daemon=True).start()
