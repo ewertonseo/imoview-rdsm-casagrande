@@ -9,4 +9,4 @@ COPY . .
 
 RUN mkdir -p logs
 
-CMD ["python", "integracao_imoview_rd.py"]
+CMD ["python", "cron.py"]
